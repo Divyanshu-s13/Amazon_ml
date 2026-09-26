@@ -5,3 +5,4 @@ scipy
 tqdm
 sparse_dot_topn
 xgboost
+rapidfuzz
