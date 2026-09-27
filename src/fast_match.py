@@ -18,7 +18,7 @@ import pandas as pd
 from rapidfuzz import fuzz
 
 # ── Configuration ─────────────────────────────────────────────────────────
-MATCH_THRESHOLD = 82       # Combined score ≥ this → final match
+MATCH_THRESHOLD = 84       # Combined score ≥ this → final match (tuned on train F0.5)
 CANDIDATE_THRESHOLD = 50   # Combined score ≥ this → candidate pair
 MAX_BLOCK = 150            # Prune blocks larger than this
 MAX_CANDS_SCORE = 30       # Max candidates to score per S1 entity
