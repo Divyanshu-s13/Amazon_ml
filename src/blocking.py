@@ -1,188 +1,270 @@
-import pandas as pd
-import numpy as np
-from sklearn.feature_extraction.text import TfidfVectorizer
-import sparse_dot_topn
-import time
+"""
+blocking.py — Scalable TF-IDF candidate generation for business entity resolution.
+
+Key improvements over previous version:
+  • Better text normalization (legal suffixes, address abbreviations)
+  • Memory-efficient: S2 and S3 processed separately (halves peak RAM)
+  • float32 sparse matrices (further halves RAM)
+  • n_threads=-1 for multi-core sparse matmul
+  • No default limit for test mode → processes ALL 1.7M test entities
+  • Random training sample for diversity
+"""
+import re
 import os
+import gc
 import shutil
 import argparse
+import time
 from collections import defaultdict
-import gc
 
+import numpy as np
+import pandas as pd
+import sparse_dot_topn
+from sklearn.feature_extraction.text import TfidfVectorizer
+
+# ── Text normalization ─────────────────────────────────────────────────────
+LEGAL_PATTERNS = [
+    (r'\bltd\.?\b', 'limited'),
+    (r'\bllc\.?\b', 'llc'),
+    (r'\binc\.?\b', 'incorporated'),
+    (r'\bcorp\.?\b', 'corporation'),
+    (r'\bco\.?\b', 'company'),
+    (r'\bpvt\.?\b', 'private'),
+    (r'\bgmbh\b', 'gmbh'),
+    (r'\bsas\b', 'sas'),
+    (r'\bplc\b', 'plc'),
+    (r'\bbv\b', 'bv'),
+    (r'\bnv\b', 'nv'),
+    (r'\bsrl\b', 'srl'),
+    (r'\bspa\b', 'spa'),
+]
+
+ADDR_PATTERNS = [
+    (r'\bst\.?\b', 'street'),
+    (r'\bave\.?\b', 'avenue'),
+    (r'\bblvd\.?\b', 'boulevard'),
+    (r'\brd\.?\b', 'road'),
+    (r'\bdr\.?\b', 'drive'),
+    (r'\bln\.?\b', 'lane'),
+    (r'\bct\.?\b', 'court'),
+    (r'\bpl\.?\b', 'place'),
+    (r'\bpkwy\.?\b', 'parkway'),
+    (r'\bapt\.?\b', 'apartment'),
+    (r'\bste\.?\b', 'suite'),
+    (r'\bflr\.?\b', 'floor'),
+    (r'\bhwy\.?\b', 'highway'),
+]
+
+_PUNCT = re.compile(r'[^\w\s]')
+_SPACE = re.compile(r'\s+')
+
+
+def _apply(text, patterns):
+    for pat, rep in patterns:
+        text = re.sub(pat, rep, text)
+    return text
+
+
+def normalize_name(text):
+    t = str(text or '').lower()
+    t = _apply(t, LEGAL_PATTERNS)
+    t = _PUNCT.sub(' ', t)
+    return _SPACE.sub(' ', t).strip()
+
+
+def normalize_address(text):
+    t = str(text or '').lower()
+    t = _apply(t, ADDR_PATTERNS)
+    t = _PUNCT.sub(' ', t)
+    return _SPACE.sub(' ', t).strip()
+
+
+def make_text(name, address):
+    return normalize_name(name) + ' ' + normalize_address(address)
+
+
+# ── Path resolution ────────────────────────────────────────────────────────
 def find_paths():
-    current_dir = os.path.dirname(os.path.abspath(__file__))
-    candidates = [
-        os.path.abspath(os.path.join(current_dir, "../../..")),
-        os.path.abspath(os.path.join(current_dir, "../..")),
-        os.path.abspath(os.path.join(current_dir, "..")),
-        os.getcwd()
-    ]
-    for candidate in candidates:
-        if os.path.exists(os.path.join(candidate, "student_resource/dataset")):
+    here = os.path.dirname(os.path.abspath(__file__))
+    for base in [
+        os.path.abspath(os.path.join(here, '../../..')),
+        os.path.abspath(os.path.join(here, '../..')),
+        os.getcwd(),
+    ]:
+        if os.path.exists(os.path.join(base, 'student_resource/dataset')):
             return (
-                os.path.join(candidate, "student_resource/dataset"),
-                os.path.join(candidate, "output")
+                os.path.join(base, 'student_resource/dataset'),
+                os.path.join(base, 'output'),
             )
-    # Default fallback
-    root = os.path.abspath(os.path.join(current_dir, "../../.."))
-    return os.path.join(root, "student_resource/dataset"), os.path.join(root, "output")
+    raise FileNotFoundError('Cannot locate student_resource/dataset')
 
-def create_blocking(mode='train', limit=None, top_n=6, threshold=0.20):
+
+# ── Core blocking ──────────────────────────────────────────────────────────
+def create_blocking(mode='train', limit=None, top_n=5, threshold=0.20):
     dataset_dir, output_dir = find_paths()
     base_path = os.path.join(dataset_dir, mode)
     os.makedirs(output_dir, exist_ok=True)
-    
-    print(f"Loading {mode} datasets from {base_path}...")
-    df1 = pd.read_csv(f"{base_path}/{mode}_source1.tsv", sep="\t").fillna('')
-    df2 = pd.read_csv(f"{base_path}/{mode}_source2.tsv", sep="\t").fillna('')
-    df3 = pd.read_csv(f"{base_path}/{mode}_source3.tsv", sep="\t").fillna('')
 
-    print(f"Total records - S1: {len(df1)}, S2: {len(df2)}, S3: {len(df3)}")
+    t_start = time.time()
+    print(f"\n{'='*55}")
+    print(f"  Blocking mode={mode}  top_n={top_n}  threshold={threshold}")
+    print(f"{'='*55}")
 
-    # For training, if limit is not set, default to 4000 S1 records to keep training fast & diverse
-    if mode == 'train' and limit is None:
-        limit = 4000
+    # ── Load datasets ──────────────────────────────────────
+    print(f"\nLoading datasets from {base_path} ...")
+    df1 = pd.read_csv(f'{base_path}/{mode}_source1.tsv', sep='\t', dtype=str).fillna('')
+    df2 = pd.read_csv(f'{base_path}/{mode}_source2.tsv', sep='\t', dtype=str).fillna('')
+    df3 = pd.read_csv(f'{base_path}/{mode}_source3.tsv', sep='\t', dtype=str).fillna('')
+    print(f"  S1:{len(df1):>10,}  S2:{len(df2):>10,}  S3:{len(df3):>10,}")
 
-    if limit is not None:
-        print(f"Limiting S1 active candidate search to first {limit} records...")
-        df1_search = df1.head(limit).copy()
+    # ── Normalize text ────────────────────────────────────
+    print("  Normalizing text ...")
+    for df in (df1, df2, df3):
+        df['text'] = [make_text(n, a)
+                      for n, a in zip(df['business_name'], df['business_address'])]
+
+    # ── Determine search set for S1 ────────────────────────
+    if mode == 'train':
+        # Random sample for diverse training data
+        train_limit = limit if limit is not None else 6000
+        df1_search = df1.sample(min(train_limit, len(df1)), random_state=42).copy()
+        print(f"  Training search: {len(df1_search):,} S1 entities (random sample)")
     else:
-        df1_search = df1
-
-    # Clean and combine text
-    print("Normalizing text for TF-IDF...")
-    for df in [df1_search, df2, df3]:
-        df['combined_text'] = (df['business_name'].astype(str) + " " + df['business_address'].astype(str)).str.lower()
+        # Test mode: ALWAYS process all S1 entities
+        if limit is not None:
+            df1_search = df1.head(limit).copy()
+            print(f"  Test search (limited): {len(df1_search):,} S1 entities")
+        else:
+            df1_search = df1
+            print(f"  Test search (FULL): {len(df1_search):,} S1 entities")
 
     countries = [c for c in df1_search['country'].unique() if c]
     results = defaultdict(list)
-    batch_size = 50000
+    BATCH = 100_000  # S1 batch size for matrix multiply (larger = fewer loop iters)
 
     for country in countries:
-        print(f"\n{'='*40}\nProcessing country: {country}")
-        c_df1 = df1_search[df1_search['country'] == country].reset_index(drop=True)
-        c_df2 = df2[df2['country'] == country].reset_index(drop=True)
-        c_df3 = df3[df3['country'] == country].reset_index(drop=True)
-        
-        print(f"  S1: {len(c_df1)} | S2: {len(c_df2)} | S3: {len(c_df3)}")
-        if len(c_df1) == 0:
+        c1 = df1_search[df1_search['country'] == country].reset_index(drop=True)
+        c2 = df2[df2['country'] == country].reset_index(drop=True)
+        c3 = df3[df3['country'] == country].reset_index(drop=True)
+
+        print(f"\n{'─'*45}")
+        print(f"  Country: {country}  |  S1={len(c1):,}  S2={len(c2):,}  S3={len(c3):,}")
+        if not len(c1):
             continue
-            
-        print("  Fitting TF-IDF vectorizer...")
-        vectorizer = TfidfVectorizer(
+
+        # ── Fit TF-IDF vectorizer ──────────────────────────
+        print("  Fitting TF-IDF vectorizer ...")
+        vect = TfidfVectorizer(
             analyzer='char_wb',
             ngram_range=(3, 4),
             min_df=2,
-            max_features=80000,
-            sublinear_tf=True
+            max_features=60_000,
+            sublinear_tf=True,
+            dtype=np.float32,
         )
-        
-        # Fit on sample of S2 and S3 for representative vocabulary
-        sample_corpus = []
-        if len(c_df2) > 0:
-            sample_corpus.extend(c_df2['combined_text'].sample(min(80000, len(c_df2)), random_state=42))
-        if len(c_df3) > 0:
-            sample_corpus.extend(c_df3['combined_text'].sample(min(80000, len(c_df3)), random_state=42))
-        if len(sample_corpus) == 0:
-            sample_corpus = c_df1['combined_text']
-            
-        vectorizer.fit(sample_corpus)
-        
-        print("  Transforming S2 and S3...")
-        t0 = time.time()
-        M2 = vectorizer.transform(c_df2['combined_text']) if len(c_df2) > 0 else None
-        M3 = vectorizer.transform(c_df3['combined_text']) if len(c_df3) > 0 else None
-        M2_T = M2.transpose() if M2 is not None else None
-        M3_T = M3.transpose() if M3 is not None else None
-        print(f"  Transformed S2 & S3 in {time.time()-t0:.2f}s")
-        
-        c_s1_ids = c_df1['entity_id'].to_numpy()
-        c_s2_ids = c_df2['entity_id'].to_numpy() if len(c_df2) > 0 else np.array([])
-        c_s3_ids = c_df3['entity_id'].to_numpy() if len(c_df3) > 0 else np.array([])
-        
-        num_batches = int(np.ceil(len(c_df1) / batch_size))
-        print(f"  Processing S1 in {num_batches} batches...")
-        
-        for i in range(num_batches):
-            start_idx = i * batch_size
-            end_idx = min((i + 1) * batch_size, len(c_df1))
-            batch_texts = c_df1['combined_text'].iloc[start_idx:end_idx]
-            batch_s1_ids = c_s1_ids[start_idx:end_idx]
-            
-            M1_batch = vectorizer.transform(batch_texts)
-            
-            if M2_T is not None:
-                matches_s2 = sparse_dot_topn.sp_matmul_topn(
-                    M1_batch, M2_T, top_n=top_n, threshold=threshold, n_threads=-1
-                )
-                rows, cols = matches_s2.nonzero()
-                for r, c in zip(rows, cols):
-                    results[batch_s1_ids[r]].append(c_s2_ids[c])
-                    
-            if M3_T is not None:
-                matches_s3 = sparse_dot_topn.sp_matmul_topn(
-                    M1_batch, M3_T, top_n=top_n, threshold=threshold, n_threads=-1
-                )
-                rows, cols = matches_s3.nonzero()
-                for r, c in zip(rows, cols):
-                    results[batch_s1_ids[r]].append(c_s3_ids[c])
-                    
-            if (i + 1) % 5 == 0 or (i + 1) == num_batches:
-                print(f"    Batch {i+1}/{num_batches} done.")
-                
-        del M2, M3, M2_T, M3_T, c_df2, c_df3, vectorizer
-        gc.collect()
+        corpus_sample = []
+        if len(c2):
+            corpus_sample += list(c2['text'].sample(min(50_000, len(c2)), random_state=42))
+        if len(c3):
+            corpus_sample += list(c3['text'].sample(min(50_000, len(c3)), random_state=42))
+        vect.fit(corpus_sample)
+        del corpus_sample
 
-    out_path = os.path.join(output_dir, f"candidate_pairs_{mode}.tsv")
-    print(f"\nSaving candidates to {out_path}...")
+        s1_ids = c1['entity_id'].to_numpy()
+        num_batches = int(np.ceil(len(c1) / BATCH))
+
+        # ── Match S1 → S2 ─────────────────────────────────
+        if len(c2):
+            print(f"  Transforming S2 ({len(c2):,} rows) ...", end=' ', flush=True)
+            t0 = time.time()
+            M2_T = vect.transform(c2['text']).T.tocsr()
+            print(f"{time.time()-t0:.1f}s")
+            s2_ids = c2['entity_id'].to_numpy()
+            for i in range(num_batches):
+                M1 = vect.transform(c1['text'].iloc[i*BATCH:(i+1)*BATCH])
+                hits = sparse_dot_topn.sp_matmul_topn(
+                    M1, M2_T, top_n=top_n, threshold=threshold, n_threads=-1)
+                rows, cols = hits.nonzero()
+                for r, c_ in zip(rows, cols):
+                    results[s1_ids[i*BATCH + r]].append(s2_ids[c_])
+                if (i+1) % 10 == 0 or (i+1) == num_batches:
+                    print(f"    S2 batch {i+1}/{num_batches}", flush=True)
+            del M2_T; gc.collect()
+
+        # ── Match S1 → S3 ─────────────────────────────────
+        if len(c3):
+            print(f"  Transforming S3 ({len(c3):,} rows) ...", end=' ', flush=True)
+            t0 = time.time()
+            M3_T = vect.transform(c3['text']).T.tocsr()
+            print(f"{time.time()-t0:.1f}s")
+            s3_ids = c3['entity_id'].to_numpy()
+            for i in range(num_batches):
+                M1 = vect.transform(c1['text'].iloc[i*BATCH:(i+1)*BATCH])
+                hits = sparse_dot_topn.sp_matmul_topn(
+                    M1, M3_T, top_n=top_n, threshold=threshold, n_threads=-1)
+                rows, cols = hits.nonzero()
+                for r, c_ in zip(rows, cols):
+                    results[s1_ids[i*BATCH + r]].append(s3_ids[c_])
+                if (i+1) % 10 == 0 or (i+1) == num_batches:
+                    print(f"    S3 batch {i+1}/{num_batches}", flush=True)
+            del M3_T; gc.collect()
+
+        del c2, c3, vect; gc.collect()
+
+    # ── Save output (ALL S1 entities must be present) ──────
+    out_path = os.path.join(output_dir, f'candidate_pairs_{mode}.tsv')
+    print(f"\nSaving → {out_path}")
+    cand_counts = []
     with open(out_path, 'w', encoding='utf-8') as f:
-        f.write("source1_entity_id\tcandidate_entity_ids\n")
-        # Ensure EVERY single S1 entity from df1 is present
-        for s1_id in df1['entity_id'].values:
-            candidates = results.get(s1_id, [])
-            if candidates:
-                seen = set()
-                deduped = [x for x in candidates if not (x in seen or seen.add(x))]
-                f.write(f"{s1_id}\t{','.join(deduped)}\n")
-            else:
-                f.write(f"{s1_id}\t\n")
-                
-    print(f"Successfully saved to {out_path}")
-    
-    if mode == 'test':
-        canonical_cand = os.path.join(output_dir, "candidate_pairs.tsv")
-        shutil.copy(out_path, canonical_cand)
-        print(f"Copied to {canonical_cand}")
+        f.write('source1_entity_id\tcandidate_entity_ids\n')
+        for eid in df1['entity_id']:
+            cands = results.get(eid, [])
+            seen = set(); deduped = []
+            for x in cands:
+                if x not in seen:
+                    seen.add(x); deduped.append(x)
+            f.write(f'{eid}\t{",".join(deduped)}\n')
+            cand_counts.append(len(deduped))
 
+    total_ents = len(cand_counts)
+    non_empty = sum(1 for c in cand_counts if c > 0)
+    avg_cands = sum(cand_counts) / max(1, total_ents)
+    print(f"  Saved {total_ents:,} rows | non-empty: {non_empty:,} | avg candidates: {avg_cands:.1f}")
+
+    if mode == 'test':
+        canon = os.path.join(output_dir, 'candidate_pairs.tsv')
+        shutil.copy(out_path, canon)
+        print(f"  Copied to {canon}")
+
+    # ── Evaluate recall on training split ─────────────────
     if mode == 'train':
-        print("\nEvaluating Blocking Recall on processed subset...")
-        gt_path = os.path.join(base_path, "train_ground_truth.tsv")
+        gt_path = os.path.join(base_path, 'train_ground_truth.tsv')
         if os.path.exists(gt_path):
-            gt_df = pd.read_csv(gt_path, sep="\t")
-            processed_s1_ids = set(df1_search['entity_id'].values)
-            gt_df = gt_df[gt_df['source1_entity_id'].isin(processed_s1_ids)]
-            
-            total_true = 0
-            total_found = 0
-            for _, row in gt_df.iterrows():
+            print("\nEvaluating blocking recall ...")
+            gt = pd.read_csv(gt_path, sep='\t')
+            proc = set(df1_search['entity_id'])
+            gt = gt[gt['source1_entity_id'].isin(proc)]
+            found = total = 0
+            for _, row in gt.iterrows():
                 val = row['matched_entity_ids']
                 if pd.isna(val) or not str(val).strip():
                     continue
                 true_ids = set(str(val).split(','))
-                s1_id = row['source1_entity_id']
-                cand_ids = set(results.get(s1_id, []))
-                total_true += len(true_ids)
-                total_found += len(true_ids.intersection(cand_ids))
-                
-            if total_true > 0:
-                recall = total_found / total_true
-                print(f"Candidate Recall: {recall:.4f} ({total_found} / {total_true})")
+                cands = set(results.get(row['source1_entity_id'], []))
+                found += len(true_ids & cands)
+                total += len(true_ids)
+            if total:
+                print(f"  Blocking Recall = {found/total:.4f}  ({found}/{total})")
+
+    print(f"\n  Total elapsed: {(time.time()-t_start)/60:.1f} min")
+
 
 if __name__ == '__main__':
-    parser = argparse.ArgumentParser()
-    parser.add_argument('--mode', type=str, default='train', choices=['train', 'test'])
-    parser.add_argument('--limit', type=int, default=None, help='Number of S1 rows to actively search')
-    parser.add_argument('--top_n', type=int, default=6, help='Top N matches per source')
-    parser.add_argument('--threshold', type=float, default=0.20, help='Similarity threshold')
-    args = parser.parse_args()
-    create_blocking(mode=args.mode, limit=args.limit, top_n=args.top_n, threshold=args.threshold)
+    ap = argparse.ArgumentParser()
+    ap.add_argument('--mode', default='train', choices=['train', 'test'])
+    ap.add_argument('--limit', type=int, default=None,
+                    help='Limit test S1 for quick testing. Leave unset for full run.')
+    ap.add_argument('--top_n', type=int, default=5)
+    ap.add_argument('--threshold', type=float, default=0.20)
+    args = ap.parse_args()
+    create_blocking(args.mode, args.limit, args.top_n, args.threshold)
